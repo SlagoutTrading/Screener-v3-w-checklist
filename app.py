@@ -18,7 +18,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+    # 3. Deep screen sequentially (20-100% of the bar)
 
 st.set_page_config(page_title="Stock Screener", page_icon=os.path.join(os.path.dirname(os.path.abspath(__file__)), "public", "assets", "favicon.png"), layout="wide", initial_sidebar_state="expanded")
 
@@ -41,8 +41,23 @@ DEFAULT_PRICE_MAX = 50.0
 DEFAULT_IV_MIN = 28.0
 DEFAULT_IV_MAX = 48.0
 DEFAULT_MIN_VOLUME = 2_000_000
-DEEP_SCREEN_WORKERS = 8
+DEEP_SCREEN_DELAY = 0.8
 SCREEN_CACHE_TTL = 3600
+FAILED_TICKERS = []
+MISSING_PRICES = []
+
+
+def fetch_with_retry(fn, max_retries=3, base_delay=2.0):
+    for attempt in range(max_retries):
+        try:
+            result = fn()
+            if result is None:
+                raise ValueError("None response")
+            return result
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    return None
 
 
 @st.cache_resource
@@ -126,14 +141,14 @@ def geo_pass(info):
     return True
 
 # ── V2 EXACT tier_name_filter ─────────────────────────────────────────
-def tier_name_filter(tickers, sectors, name_map):
+def tier_name_filter(tickers):
     """First-pass filter — no industry/sector exclusions in V3."""
     return list(tickers)
 
 # ── V2 EXACT deep_screen ──────────────────────────────────────────────
 def deep_screen(ticker, price, iv_min, iv_max, min_vol):
     result = {
-        "ticker": ticker, "qualified": False, "fail_reason": "",
+        "ticker": ticker, "qualified": False, "status": "rejected", "fail_reason": "",
         "company_name": "", "sector": "", "industry": "",
         "price": price, "iv": None, "volume": 0,
         "avg_volume": 0, "margin": None, "cagr": None,
@@ -141,9 +156,18 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
     }
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info
+        info = fetch_with_retry(lambda: stock.info)
+        if info is None:
+            if ticker not in FAILED_TICKERS:
+                FAILED_TICKERS.append(ticker)
+            result["status"] = "fetch_error"
+            result["fail_reason"] = "FETCH_ERROR: max retries exceeded"
+            return result
         if not info:
-            result["fail_reason"] = "No data"
+            if ticker not in FAILED_TICKERS:
+                FAILED_TICKERS.append(ticker)
+            result["status"] = "fetch_error"
+            result["fail_reason"] = "FETCH_ERROR: empty response"
             return result
 
         result["company_name"] = info.get("longName") or info.get("shortName") or ticker
@@ -228,6 +252,9 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
                     iv_approx = call_price / (price * 0.4 * (tte ** 0.5))
                     if 0.01 < iv_approx < 5.0:
                         iv_pct = iv_approx * 100
+                        if iv_pct > 100:
+                            result["fail_reason"] = f"IV {iv_pct:.1f}% anomalous — suspect quote"
+                            return result
                         if iv_min <= iv_pct <= iv_max:
                             result["iv"] = round(iv_pct, 1)
                             iv_found = True
@@ -244,6 +271,9 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
                     iv_approx = put_price / (price * 0.4 * (tte ** 0.5))
                     if 0.01 < iv_approx < 5.0:
                         iv_pct = iv_approx * 100
+                        if iv_pct > 100:
+                            result["fail_reason"] = f"IV {iv_pct:.1f}% anomalous — suspect quote"
+                            return result
                         if iv_min <= iv_pct <= iv_max:
                             result["iv"] = round(iv_pct, 1)
                             iv_found = True
@@ -264,6 +294,9 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
                         chain_iv = nc.get("impliedVolatility")
                         if chain_iv and float(chain_iv) > 0.001:
                             iv_pct = float(chain_iv) * 100
+                            if iv_pct > 100:
+                                result["fail_reason"] = f"IV {iv_pct:.1f}% anomalous — suspect quote"
+                                return result
                             if iv_min <= iv_pct <= iv_max:
                                 result["iv"] = round(iv_pct, 1)
                                 iv_found = True
@@ -327,9 +360,13 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
             result["driver"] = ticker
 
         result["qualified"] = True
+        result["status"] = "ok"
         return result
 
     except Exception as e:
+        if ticker not in FAILED_TICKERS:
+            FAILED_TICKERS.append(ticker)
+        result["status"] = "fetch_error"
         result["fail_reason"] = f"Error: {type(e).__name__}: {str(e)[:150]}"
         return result
 
@@ -450,7 +487,7 @@ def render_progress(ph, tiers, idx, tier_pct, detail, found=0):
     )
 
 # ── TIER SCAN (V2 exact pipeline: industry filter → batch price → deep) ──
-def scan_tier(tier_name, tickers, sectors, name_map, price_min, price_max,
+def scan_tier(tier_name, tickers, price_min, price_max,
               iv_min, iv_max, min_vol, report):
     qualified = []
     failed = []
@@ -460,7 +497,7 @@ def scan_tier(tier_name, tickers, sectors, name_map, price_min, price_max,
         return [], []
 
     # 1. Industry/name pre-filter (V2 exact)
-    passed = tier_name_filter(tickers, sectors, name_map)
+    passed = tier_name_filter(tickers)
     if not passed:
         return [], []
 
@@ -471,24 +508,48 @@ def scan_tier(tier_name, tickers, sectors, name_map, price_min, price_max,
         report(20 * i / len(passed), f"Filtering {len(passed)} tickers by price", 0)
         try:
             data = yf.download(
-                ",".join(batch),
+                batch,
                 period="1d",
                 interval="1d",
                 progress=False,
                 auto_adjust=False,
+                group_by="ticker",
             )
             if data.empty:
+                MISSING_PRICES.extend(t for t in batch if t not in MISSING_PRICES)
                 continue
-            if "Close" in data.columns.levels[0]:
-                closes = data["Close"].iloc[-1]
+            if isinstance(data.columns, pd.MultiIndex):
+                close_level = next(
+                    (level for level in range(data.columns.nlevels)
+                     if "Close" in data.columns.get_level_values(level)),
+                    None,
+                )
+                if close_level is None:
+                    closes = pd.Series(dtype="float64")
+                else:
+                    close_data = data.xs("Close", axis=1, level=close_level)
+                    closes = close_data.iloc[-1]
             else:
-                closes = data.iloc[-1]
+                if "Close" in data.columns:
+                    close_data = data["Close"]
+                    if isinstance(close_data, pd.DataFrame):
+                        closes = close_data.iloc[-1]
+                    else:
+                        closes = pd.Series({batch[0]: close_data.iloc[-1]})
+                else:
+                    closes = pd.Series(dtype="float64")
             for t in batch:
                 if t in closes.index:
                     px = float(closes[t])
                     if pd.notna(px) and price_min <= px <= price_max:
                         priced.append((t, px))
+                    elif pd.isna(px):
+                        if t not in MISSING_PRICES:
+                            MISSING_PRICES.append(t)
+                elif t not in MISSING_PRICES:
+                    MISSING_PRICES.append(t)
         except Exception:
+            MISSING_PRICES.extend(t for t in batch if t not in MISSING_PRICES)
             continue
 
     if not priced:
@@ -504,24 +565,27 @@ def scan_tier(tier_name, tickers, sectors, name_map, price_min, price_max,
         key = (t, round(px, 2), iv_min, iv_max, min_vol)
         hit = cache.get(key)
         if hit and time.time() - hit[0] < SCREEN_CACHE_TTL:
-            return dict(hit[1])
+            cached = dict(hit[1])
+            cached.setdefault("status", "ok" if cached["qualified"] else "rejected")
+            return cached
         r = deep_screen(t, px, iv_min, iv_max, min_vol)
         # Don't cache Yahoo throttling/errors, so they are retried next run
-        if r["qualified"] or not any(s in r["fail_reason"] for s in ("Yahoo", "Error:", "No data")):
+        if r["status"] != "fetch_error" and not any(
+            s in r["fail_reason"] for s in ("Yahoo", "Error:", "No data")
+        ):
             cache[key] = (time.time(), dict(r))
         return r
 
-    with ThreadPoolExecutor(max_workers=DEEP_SCREEN_WORKERS) as pool:
-        futures = {pool.submit(screen_cached, t, px): i
-                   for i, (t, px) in enumerate(priced)}
-        for fut in as_completed(futures):
-            result = fut.result()
-            result["tier"] = tier_name
-            results[futures[fut]] = result
-            done += 1
-            n_q = sum(1 for r in results.values() if r["qualified"])
-            report(20 + 80 * done / total_priced,
-                   f"Deep screening {done} of {total_priced} candidates", n_q)
+    for i, (ticker, price) in enumerate(priced):
+        result = screen_cached(ticker, price)
+        result["tier"] = tier_name
+        results[i] = result
+        done += 1
+        n_q = sum(1 for r in results.values() if r["qualified"])
+        report(20 + 80 * done / total_priced,
+               f"Deep screening {done} of {total_priced} candidates", n_q)
+        if done < total_priced:
+            time.sleep(DEEP_SCREEN_DELAY)
     for i in sorted(results):
         (qualified if results[i]["qualified"] else failed).append(results[i])
 
@@ -723,15 +787,14 @@ if run:
     elif not selected:
         st.error("Select at least one tier.")
     else:
+        FAILED_TICKERS.clear()
+        MISSING_PRICES.clear()
         all_qualified = []
         all_failed = []
         loader_ph = st.empty()
 
         for tier_idx, tier_name in enumerate(selected):
             render_progress(loader_ph, selected, tier_idx, 0, "Loading tickers", len(all_qualified))
-
-            sectors = {}
-            name_map = {}
 
             if tier_name == "Rest":
                 prev = []
@@ -744,7 +807,7 @@ if run:
                     st.info("No stocks loaded for Rest of Market.")
                     continue
             else:
-                tickers, sectors = load_index(tier_name)
+                tickers, _ = load_index(tier_name)
                 if not tickers:
                     st.warning(f"Could not load {tier_name}.")
                     continue
@@ -752,13 +815,15 @@ if run:
             def report(pct, detail, n_q, _i=tier_idx, _base=len(all_qualified)):
                 render_progress(loader_ph, selected, _i, pct, detail, _base + n_q)
 
-            q, f = scan_tier(tier_name, tickers, sectors, name_map,
-                             price_min, price_max, iv_min, iv_max, min_vol, report)
+            q, f = scan_tier(tier_name, tickers, price_min, price_max,
+                             iv_min, iv_max, min_vol, report)
             all_qualified.extend(q)
             all_failed.extend(f)
 
         loader_ph.empty()
         st.session_state.results = (all_qualified, all_failed)
+        st.session_state.failed_tickers = list(FAILED_TICKERS)
+        st.session_state.missing_prices = list(MISSING_PRICES)
 
 
 def build_pdf(rows):
@@ -791,6 +856,13 @@ def build_pdf(rows):
 def render_results(all_qualified, all_failed):
         st.markdown("---")
         st.markdown("## Results: " + str(len(all_qualified)) + " qualified")
+        failed_tickers = st.session_state.get("failed_tickers", [])
+        missing_prices = st.session_state.get("missing_prices", [])
+        if failed_tickers:
+            st.error(f"⚠️ {len(failed_tickers)} tickers failed to fetch: {', '.join(failed_tickers)}")
+        if missing_prices:
+            st.error(f"⚠️ {len(missing_prices)} tickers missing from batch price data")
+            st.caption(f"Missing price tickers: {', '.join(missing_prices)}")
 
         if all_qualified:
             for idx, q in enumerate(all_qualified, 1):
@@ -856,13 +928,17 @@ def render_results(all_qualified, all_failed):
         else:
             st.warning("No qualified companies found.")
 
-        if all_failed:
-            with st.expander(f"📊 Failure Summary ({len(all_failed)} total)"):
-                reasons = Counter()
-                for r in all_failed[:200]:
-                    reasons[r.get("fail_reason", "Unknown")[:200]] += 1
-                for reason, count in reasons.most_common(10):
-                    st.markdown(f"- **{reason}**: {count}")
+        with st.expander(f"📊 Failure Summary ({len(all_failed)} total)"):
+            st.markdown(f"**Fetch errors: {sum(r.get('status') == 'fetch_error' for r in all_failed)}**")
+            st.markdown(f"**Filter rejections: {sum(r.get('status', 'rejected') == 'rejected' for r in all_failed)}**")
+            st.markdown(f"**Missing batch prices: {len(missing_prices)}**")
+            for status, label in (("fetch_error", "Fetch errors"), ("rejected", "Filter rejections")):
+                status_rows = [r for r in all_failed if r.get("status", "rejected") == status]
+                if status_rows:
+                    st.markdown(f"**{label} by reason**")
+                    reasons = Counter(r.get("fail_reason", "Unknown")[:200] for r in status_rows)
+                    for reason, count in reasons.most_common(10):
+                        st.markdown(f"- **{reason}**: {count}")
 
 
 if "results" in st.session_state:
