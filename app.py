@@ -41,13 +41,13 @@ DEFAULT_PRICE_MAX = 50.0
 DEFAULT_IV_MIN = 28.0
 DEFAULT_IV_MAX = 48.0
 DEFAULT_MIN_VOLUME = 2_000_000
-DEEP_SCREEN_DELAY = 0.8
+DEEP_SCREEN_WORKERS = 3
 SCREEN_CACHE_TTL = 3600
 FAILED_TICKERS = []
 MISSING_PRICES = []
 
 
-def fetch_with_retry(fn, max_retries=3, base_delay=2.0):
+def fetch_with_retry(fn, max_retries=2, base_delay=0.5):
     for attempt in range(max_retries):
         try:
             result = fn()
@@ -56,7 +56,7 @@ def fetch_with_retry(fn, max_retries=3, base_delay=2.0):
             return result
         except Exception:
             if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
+                time.sleep(base_delay * (attempt + 1))
     return None
 
 
@@ -115,14 +115,18 @@ def _rest_tickers(exclude):
             cols = dl[0].split("|" if "|" in dl[0] else "\t")
             cm = {c.strip().lower():i for i,c in enumerate(cols)}
             si = cm.get("symbol", cm.get("act symbol",0))
+            sni = cm.get("security name", None)
             ti = cm.get("test issue",None); ei = cm.get("etf",None)
             for line in dl[1:]:
                 p = line.split("|" if "|" in line else "\t")
                 if len(p)<=si: continue
                 s = p[si].strip().replace(".","-")
-                if not re.match(r"^[A-Z0-9-]{1,5}$",s): continue
+                if not re.match(r"^[A-Z]{1,5}$",s): continue
                 if ti and len(p)>ti and p[ti].strip().upper()=="Y": continue
                 if ei and len(p)>ei and p[ei].strip().upper()=="Y": continue
+                sec_name = p[sni].strip().lower() if sni and len(p)>sni else ""
+                if any(w in sec_name for w in ["warrant", "unit", "right", "preferred", "pfd", "debt", "notes", "due 20", "depositary share", "etn"]):
+                    continue
                 if s in exclude: continue
                 tk.add(s)
         except: pass
@@ -204,15 +208,13 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
         # Options liquidity check (need 2+ weeklies with volume)
         exp_dates = ()
         opt_err = ""
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 exp_dates = stock.options
-                if exp_dates:
-                    break
-                opt_err = " (Yahoo Finance returned no expirations, likely throttled)"
+                break
             except Exception as e:
                 opt_err = f" (Yahoo Finance error: {type(e).__name__}: {str(e)[:120]})"
-            time.sleep(1.5 * (attempt + 1))
+                time.sleep(0.5)
         if not exp_dates or len(exp_dates) < 2:
             result["fail_reason"] = f"No weekly options chain{opt_err}"
             return result
@@ -236,6 +238,7 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
         iv_found = False
         now = datetime.now()
         target_30d = now + timedelta(days=30)
+        last_calc_iv = None
 
         try:
             best_exp = min(exp_dates, key=lambda e: abs(
@@ -252,15 +255,11 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
                     iv_approx = call_price / (price * 0.4 * (tte ** 0.5))
                     if 0.01 < iv_approx < 5.0:
                         iv_pct = iv_approx * 100
-                        if iv_pct > 100:
-                            result["fail_reason"] = f"IV {iv_pct:.1f}% anomalous — suspect quote"
-                            return result
-                        if iv_min <= iv_pct <= iv_max:
-                            result["iv"] = round(iv_pct, 1)
-                            iv_found = True
-                        else:
-                            result["fail_reason"] = f"IV {iv_pct:.1f}% outside {iv_min}-{iv_max}% range"
-                            return result
+                        if iv_pct <= 100:
+                            last_calc_iv = iv_pct
+                            if iv_min <= iv_pct <= iv_max:
+                                result["iv"] = round(iv_pct, 1)
+                                iv_found = True
 
             if not iv_found and not chain_30d.puts.empty:
                 chain_30d.puts["dist"] = abs(chain_30d.puts["strike"] - price)
@@ -271,15 +270,12 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
                     iv_approx = put_price / (price * 0.4 * (tte ** 0.5))
                     if 0.01 < iv_approx < 5.0:
                         iv_pct = iv_approx * 100
-                        if iv_pct > 100:
-                            result["fail_reason"] = f"IV {iv_pct:.1f}% anomalous — suspect quote"
-                            return result
-                        if iv_min <= iv_pct <= iv_max:
-                            result["iv"] = round(iv_pct, 1)
-                            iv_found = True
-                        else:
-                            result["fail_reason"] = f"IV {iv_pct:.1f}% outside {iv_min}-{iv_max}% range"
-                            return result
+                        if iv_pct <= 100:
+                            if last_calc_iv is None:
+                                last_calc_iv = iv_pct
+                            if iv_min <= iv_pct <= iv_max:
+                                result["iv"] = round(iv_pct, 1)
+                                iv_found = True
         except Exception:
             pass
 
@@ -294,18 +290,21 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
                         chain_iv = nc.get("impliedVolatility")
                         if chain_iv and float(chain_iv) > 0.001:
                             iv_pct = float(chain_iv) * 100
-                            if iv_pct > 100:
-                                result["fail_reason"] = f"IV {iv_pct:.1f}% anomalous — suspect quote"
-                                return result
-                            if iv_min <= iv_pct <= iv_max:
-                                result["iv"] = round(iv_pct, 1)
-                                iv_found = True
-                                break
+                            if iv_pct <= 100:
+                                if last_calc_iv is None:
+                                    last_calc_iv = iv_pct
+                                if iv_min <= iv_pct <= iv_max:
+                                    result["iv"] = round(iv_pct, 1)
+                                    iv_found = True
+                                    break
                 except Exception:
                     pass
 
         if not iv_found:
-            result["fail_reason"] = "No IV data available"
+            if last_calc_iv is not None:
+                result["fail_reason"] = f"IV {last_calc_iv:.1f}% outside {iv_min}-{iv_max}% range"
+            else:
+                result["fail_reason"] = "No IV data available"
             return result
 
         # Margin check
@@ -501,15 +500,16 @@ def scan_tier(tier_name, tickers, price_min, price_max,
     if not passed:
         return [], []
 
-    # 2. Batch price filter (yf.download in groups of 300); occupies 0-20% of the bar
+    # 2. Batch price & volume filter (yf.download in groups of 250); occupies 0-20% of the bar
     priced = []
-    for i in range(0, len(passed), 300):
-        batch = passed[i:i + 300]
-        report(20 * i / len(passed), f"Filtering {len(passed)} tickers by price", 0)
+    batch_size = 250
+    for i in range(0, len(passed), batch_size):
+        batch = passed[i:i + batch_size]
+        report(20 * i / len(passed), f"Filtering {len(passed)} tickers by price & volume", 0)
         try:
             data = yf.download(
                 batch,
-                period="1d",
+                period="5d",
                 interval="1d",
                 progress=False,
                 auto_adjust=False,
@@ -526,23 +526,28 @@ def scan_tier(tier_name, tickers, price_min, price_max,
                 )
                 if close_level is None:
                     closes = pd.Series(dtype="float64")
+                    vols = pd.Series(dtype="float64")
                 else:
-                    close_data = data.xs("Close", axis=1, level=close_level)
-                    closes = close_data.iloc[-1]
+                    closes = data.xs("Close", axis=1, level=close_level).iloc[-1]
+                    vols = data.xs("Volume", axis=1, level=close_level).max()
             else:
                 if "Close" in data.columns:
                     close_data = data["Close"]
-                    if isinstance(close_data, pd.DataFrame):
-                        closes = close_data.iloc[-1]
-                    else:
-                        closes = pd.Series({batch[0]: close_data.iloc[-1]})
+                    closes = close_data.iloc[-1] if isinstance(close_data, pd.DataFrame) else pd.Series({batch[0]: close_data.iloc[-1]})
+                    vol_data = data.get("Volume")
+                    vols = vol_data.max() if isinstance(vol_data, pd.DataFrame) else pd.Series({batch[0]: vol_data.max() if vol_data is not None else 0})
                 else:
                     closes = pd.Series(dtype="float64")
+                    vols = pd.Series(dtype="float64")
+
             for t in batch:
                 if t in closes.index:
                     px = float(closes[t])
                     if pd.notna(px) and price_min <= px <= price_max:
-                        priced.append((t, px))
+                        # Pre-filter: if recent 5-day max volume is known, ensure it is at least 30% of min_vol
+                        v_max = float(vols.get(t, 0)) if (t in vols.index and pd.notna(vols.get(t, 0))) else 0
+                        if v_max == 0 or v_max >= min_vol * 0.3:
+                            priced.append((t, px))
                     elif pd.isna(px):
                         if t not in MISSING_PRICES:
                             MISSING_PRICES.append(t)
@@ -576,16 +581,23 @@ def scan_tier(tier_name, tickers, price_min, price_max,
             cache[key] = (time.time(), dict(r))
         return r
 
-    for i, (ticker, price) in enumerate(priced):
-        result = screen_cached(ticker, price)
-        result["tier"] = tier_name
-        results[i] = result
-        done += 1
-        n_q = sum(1 for r in results.values() if r["qualified"])
-        report(20 + 80 * done / total_priced,
-               f"Deep screening {done} of {total_priced} candidates", n_q)
-        if done < total_priced:
-            time.sleep(DEEP_SCREEN_DELAY)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=DEEP_SCREEN_WORKERS) as pool:
+        futures = {pool.submit(screen_cached, t, px): (idx, t)
+                   for idx, (t, px) in enumerate(priced)}
+        for fut in as_completed(futures):
+            idx, t = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                result = {"ticker": t, "qualified": False, "status": "fetch_error", "fail_reason": f"Error: {e}"}
+            result["tier"] = tier_name
+            results[idx] = result
+            done += 1
+            n_q = sum(1 for r in results.values() if r.get("qualified"))
+            report(20 + 80 * done / total_priced,
+                   f"Deep screening {done} of {total_priced} candidates", n_q)
+
     for i in sorted(results):
         (qualified if results[i]["qualified"] else failed).append(results[i])
 
@@ -716,6 +728,7 @@ tier_keys = list(TIERS.keys())
 if "_tier_init" not in st.session_state:
     for k in tier_keys:
         st.session_state[f"tc_{k}"] = (k == "S&P 500")
+        st.session_state[f"cb_{k}"] = (k == "S&P 500")
     st.session_state._tier_init = True
 
 # Preset handler
@@ -757,11 +770,14 @@ with st.sidebar:
 
     for k in tier_keys:
         ck = f"tc_{k}"
+        bk = f"cb_{k}"
         if ck not in st.session_state:
             st.session_state[ck] = (k == "S&P 500")
-        st.checkbox(f"{TIERS[k]['label']} — {TIERS[k]['desc']}",
-                    value=st.session_state[ck], key=f"cb_{k}")
-        st.session_state[ck] = st.session_state[f"cb_{k}"]
+        if bk not in st.session_state:
+            st.session_state[bk] = st.session_state[ck]
+        val = st.checkbox(f"{TIERS[k]['label']} — {TIERS[k]['desc']}",
+                          value=st.session_state[ck], key=bk)
+        st.session_state[ck] = val
 
     st.markdown('<div class="section-label">Parameters</div>', unsafe_allow_html=True)
     pr = st.columns(2)
@@ -797,12 +813,14 @@ if run:
             render_progress(loader_ph, selected, tier_idx, 0, "Loading tickers", len(all_qualified))
 
             if tier_name == "Rest":
-                prev = []
+                index_tickers = set()
                 for k in ["S&P 500", "S&P 400", "S&P 600"]:
-                    if k in selected[:selected.index(tier_name)]:
-                        tk, _ = load_index(k)
-                        prev.extend(tk)
-                tickers = get_rest_tickers(set(prev))
+                    try:
+                        tk = get_tickers(k)
+                        index_tickers.update(tk)
+                    except Exception:
+                        pass
+                tickers = get_rest_tickers(index_tickers)
                 if not tickers:
                     st.info("No stocks loaded for Rest of Market.")
                     continue
