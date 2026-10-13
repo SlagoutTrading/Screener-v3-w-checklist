@@ -168,6 +168,55 @@ def load_index(name):
 @st.cache_data(ttl=3600)
 def get_tickers(name): return load_index(name)[0]
 
+@st.cache_data(ttl=900, show_spinner=False)
+def nasdaq_universe():
+    """Fetch all listed US stocks with current price, volume, sector and industry in a single request."""
+    url = ("https://api.nasdaq.com/api/screener/stocks"
+           "?tableonly=true&limit=25&offset=0&download=true")
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=h, timeout=30)
+            r.raise_for_status()
+            rows = r.json().get("data", {}).get("rows", [])
+            out = {}
+            for row in rows:
+                raw_sym = row.get("symbol") or ""
+                # Normalize share classes: Nasdaq uses 'BRK/B' or 'BRK.B', app uses 'BRK-B'
+                sym = raw_sym.replace("/", "-").replace(".", "-").upper().strip()
+                price_str = (row.get("lastsale") or "").replace("$", "").replace(",", "").strip()
+                try:
+                    px = float(price_str)
+                except ValueError:
+                    continue
+                try:
+                    vol = int((row.get("volume") or "0").replace(",", "").strip())
+                except ValueError:
+                    vol = 0
+                if not sym:
+                    continue
+                out[sym] = {
+                    "price": px,
+                    "volume": vol,
+                    "name": row.get("name") or "",
+                    "market_cap": row.get("marketCap") or "",
+                    "sector": row.get("sector") or "",
+                    "industry": row.get("industry") or "",
+                    "country": row.get("country") or "",
+                }
+            return out
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
+    return {}
+
+
 def get_rest_tickers(exclude):
     return _rest_tickers(frozenset(exclude))
 
@@ -555,29 +604,14 @@ def render_progress(ph, tiers, idx, tier_pct, detail, found=0):
         unsafe_allow_html=True,
     )
 
-# ── TIER SCAN (V2 exact pipeline: industry filter → batch price → deep) ──
-def scan_tier(tier_name, tickers, price_min, price_max,
-              iv_min, iv_max, min_vol, report):
-    qualified = []
-    failed = []
-    report(0, f"Loaded {len(tickers)} tickers", 0)
-
-    if not tickers:
-        return [], []
-
-    # 1. Industry/name pre-filter & delisted/junk symbol filter
-    passed = pre_filter_tickers(tier_name_filter(tickers))
-    if not passed:
-        return [], []
-
+def _legacy_yahoo_prefilter(passed, price_min, price_max, min_vol, report):
+    """Fallback batch price & volume filter via yfinance if Nasdaq screener is unreachable."""
     sess = get_yfinance_session()
-
-    # 2. Batch price & volume filter (yf.download in groups of 150); occupies 0-20% of the bar
     priced = []
     batch_size = 150
     for i in range(0, len(passed), batch_size):
         batch = passed[i:i + batch_size]
-        report(20 * i / len(passed), f"Filtering {len(passed)} tickers by price & volume", 0)
+        report(20 * i / len(passed), f"Filtering {len(passed)} tickers by price & volume (Yahoo fallback)", 0)
         try:
             data = yf.download(
                 batch,
@@ -588,7 +622,6 @@ def scan_tier(tier_name, tickers, price_min, price_max,
                 group_by="ticker",
                 session=sess,
             )
-            # Rate limit backoff between batches to prevent 429s
             time.sleep(1.0)
             if data.empty:
                 MISSING_PRICES.extend(t for t in batch if t not in MISSING_PRICES)
@@ -619,7 +652,6 @@ def scan_tier(tier_name, tickers, price_min, price_max,
                 if t in closes.index:
                     px = float(closes[t])
                     if pd.notna(px) and price_min <= px <= price_max:
-                        # Pre-filter: if recent 5-day max volume is known, ensure it is at least 30% of min_vol
                         v_max = float(vols.get(t, 0)) if (t in vols.index and pd.notna(vols.get(t, 0))) else 0
                         if v_max == 0 or v_max >= min_vol * 0.3:
                             priced.append((t, px))
@@ -631,6 +663,42 @@ def scan_tier(tier_name, tickers, price_min, price_max,
         except Exception:
             MISSING_PRICES.extend(t for t in batch if t not in MISSING_PRICES)
             continue
+    return priced
+
+
+# ── TIER SCAN (V2 exact pipeline: industry filter → batch price → deep) ──
+def scan_tier(tier_name, tickers, price_min, price_max,
+              iv_min, iv_max, min_vol, report):
+    qualified = []
+    failed = []
+    report(0, f"Loaded {len(tickers)} tickers", 0)
+
+    if not tickers:
+        return [], []
+
+    # 1. Industry/name pre-filter & delisted/junk symbol filter
+    passed = pre_filter_tickers(tier_name_filter(tickers))
+    if not passed:
+        return [], []
+
+    # 2. Fast price & volume pre-filter using Nasdaq universe (1 single request, no API key)
+    universe = nasdaq_universe()
+    if universe:
+        report(10, f"Screening {len(passed)} tickers via Nasdaq universe", 0)
+        priced = []
+        for t in passed:
+            u = universe.get(t)
+            if not u:
+                continue  # delisted/unlisted or non-common equity — skip silently
+            if price_min <= u["price"] <= price_max:
+                # Volume heuristic: check recent day volume before deep screening
+                if u["volume"] == 0 or u["volume"] >= min_vol * 0.3:
+                    priced.append((t, u["price"]))
+    else:
+        # Fallback to batched Yahoo download if Nasdaq screener API is temporarily unavailable
+        priced = _legacy_yahoo_prefilter(passed, price_min, price_max, min_vol, report)
+
+    report(20, f"{len(priced)} of {len(passed)} pass price filter", 0)
 
     if not priced:
         return [], []
@@ -809,7 +877,6 @@ tier_keys = list(TIERS.keys())
 if "_tier_init" not in st.session_state:
     for k in tier_keys:
         st.session_state[f"tc_{k}"] = (k == "S&P 500")
-        st.session_state[f"cb_{k}"] = (k == "S&P 500")
     st.session_state._tier_init = True
 
 # Preset handler
@@ -852,12 +919,9 @@ with st.sidebar:
     for k in tier_keys:
         ck = f"tc_{k}"
         bk = f"cb_{k}"
-        if ck not in st.session_state:
-            st.session_state[ck] = (k == "S&P 500")
         if bk not in st.session_state:
-            st.session_state[bk] = st.session_state[ck]
-        val = st.checkbox(f"{TIERS[k]['label']} — {TIERS[k]['desc']}",
-                          value=st.session_state[ck], key=bk)
+            st.session_state[bk] = st.session_state.get(ck, (k == "S&P 500"))
+        val = st.checkbox(f"{TIERS[k]['label']} — {TIERS[k]['desc']}", key=bk)
         st.session_state[ck] = val
 
     st.markdown('<div class="section-label">Parameters</div>', unsafe_allow_html=True)
