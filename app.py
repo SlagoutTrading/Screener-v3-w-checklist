@@ -16,6 +16,7 @@ import re
 import html
 import os
 import sys
+import urllib.parse
 from datetime import datetime, timedelta
 from collections import Counter
     # 3. Deep screen sequentially (20-100% of the bar)
@@ -634,6 +635,10 @@ header[data-testid="stHeader"]{background:transparent}
 .metric b{font-size:0.98rem;color:#1f2328;font-weight:600}
 .pos{color:#1f9d63!important}.neg{color:#d64545!important}
 .tier-tag{display:inline-block;padding:0.1rem 0.55rem;border-radius:999px;font-size:0.68rem;font-weight:600;color:#fff;margin-left:0.5rem;vertical-align:middle}
+.card-links{display:flex;align-items:center;gap:0.45rem;margin-top:0.4rem;flex-wrap:wrap}
+.ext-link{display:inline-flex;align-items:center;gap:0.28rem;padding:0.22rem 0.55rem;font-size:0.72rem;font-weight:500;border-radius:6px;border:1px solid #e6e3de;background:#f6f5f3;color:#374151;text-decoration:none;transition:all .15s ease}
+.ext-link:hover{border-color:#ff6b3d;color:#ff6b3d;text-decoration:none;background:#fff5f0}
+.ext-link svg{width:11px;height:11px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;fill:none}
 .driver{margin-top:0.8rem;font-size:0.82rem;color:#6b7280;line-height:1.5}
 .stButton>button{border-radius:8px;border:1px solid #e6e3de;background:#fff;color:#1f2328;font-weight:500}
 .stButton>button:hover{border-color:#ff6b3d;color:#ff6b3d}
@@ -687,6 +692,8 @@ section[data-testid="stSidebar"]{{background:{t['soft']}!important;border-right:
 .main-title,.card-name,.card-price,.metric b,.side-brand,.loader-title,.loader-card b,.chip b,.loader-tip b,.loader-pct,.pixel-pct{{color:{t['text']}!important}}
 .subtitle,.section-label,.card-sub,.metric span,.driver,.loader-detail,.loader-tip,.loader-card span{{color:{t['muted']}!important}}
 .card,.chip,.loader-card{{background:{t['panel']}!important;border-color:{t['border']}!important}}
+.ext-link{{background:{t['soft']}!important;border-color:{t['border']}!important;color:{t['text']}!important}}
+.ext-link:hover{{border-color:{t['btn']}!important;color:{t['btn']}!important}}
 .metric{{background:{t['soft']}!important}}
 .chip.ok{{background:{t['ok']}!important;border-color:{t['ok_b']}!important}}
 .chip.no{{background:{t['no']}!important;border-color:{t['no_b']}!important}}
@@ -889,12 +896,24 @@ def render_results(all_qualified, all_failed):
                 cagr = q.get("cagr")
                 cagr_html = (f"<b class='{'pos' if cagr >= 0 else 'neg'}'>{cagr:+.1f}%</b>"
                              if cagr is not None else "<b>—</b>")
-                name = html.escape(q.get("company_name", ""))
+                tkr = q.get("ticker", "")
+                tkr_esc = html.escape(tkr)
+                tkr_param = urllib.parse.quote(tkr)
+                tkr_lower = urllib.parse.quote(tkr.lower())
+                ss_url = f"https://app.stocksimplifier.com/simplify?ticker={tkr_param}"
+                sw_url = f"https://simplywall.st/stocks/{tkr_lower}"
+                ext_icon = ("<svg viewBox='0 0 24 24'><path d='M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/>"
+                            "<polyline points='15 3 21 3 21 9'/><line x1='10' y1='14' x2='21' y2='3'/></svg>")
+
                 st.markdown(
                     f"<div class='card'><div class='card-head'><div>"
-                    f"<div class='card-name'>{name} · {html.escape(q['ticker'])}"
+                    f"<div class='card-name'>{name} · {tkr_esc}"
                     f"<span class='tier-tag' style='background:{tc}'>{html.escape(tn)}</span></div>"
-                    f"<div class='card-sub'>{html.escape(q.get('sector','N/A'))} / {html.escape(q.get('industry','N/A'))}</div></div>"
+                    f"<div class='card-sub'>{html.escape(q.get('sector','N/A'))} / {html.escape(q.get('industry','N/A'))}</div>"
+                    f"<div class='card-links'>"
+                    f"<a class='ext-link' href='{ss_url}' target='_blank' rel='noopener noreferrer'>{ext_icon} Stock Simplifier</a>"
+                    f"<a class='ext-link' href='{sw_url}' target='_blank' rel='noopener noreferrer'>{ext_icon} Simply Wall St</a>"
+                    f"</div></div>"
                     f"<div class='card-price'>${q['price']:.2f}</div></div>"
                     f"<div class='metrics'>"
                     f"<div class='metric'><span>IV</span><b>{q['iv']:.1f}%</b></div>"
@@ -907,10 +926,13 @@ def render_results(all_qualified, all_failed):
 
             # ── CSV download ──
             csv_lines = []
-            csv_lines.append("ticker,company_name,price,iv,avg_volume,margin,cagr,sector,industry,tier,options_liquid,driver")
+            csv_lines.append("ticker,company_name,price,iv,avg_volume,margin,cagr,sector,industry,tier,options_liquid,driver,stock_simplifier_url,simply_wall_st_url")
             for q in all_qualified:
+                t_val = q.get("ticker", "")
+                ss_lnk = f"https://app.stocksimplifier.com/simplify?ticker={urllib.parse.quote(t_val)}"
+                sw_lnk = f"https://simplywall.st/stocks/{urllib.parse.quote(t_val.lower())}"
                 row = (
-                    q.get("ticker",""),
+                    t_val,
                     q.get("company_name","").replace(","," "),
                     q.get("price",0),
                     q.get("iv",0),
@@ -922,6 +944,8 @@ def render_results(all_qualified, all_failed):
                     q.get("tier",""),
                     "Yes" if q.get("options_liquid") else "No",
                     q.get("driver","").replace(","," "),
+                    ss_lnk,
+                    sw_lnk,
                 )
                 csv_lines.append(",".join(str(v) for v in row))
             csv_data = "\n".join(csv_lines)
