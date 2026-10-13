@@ -1040,9 +1040,8 @@ def render_results(all_qualified, all_failed):
                 tkr = q.get("ticker", "")
                 tkr_esc = html.escape(tkr)
                 tkr_param = urllib.parse.quote(tkr)
-                tkr_lower = urllib.parse.quote(tkr.lower())
                 ss_url = f"https://app.stocksimplifier.com/simplify?ticker={tkr_param}"
-                sw_url = f"https://simplywall.st/stocks/{tkr_lower}"
+                sw_url = f"https://simplywall.st/search?{urllib.parse.urlencode({'q': tkr})}"
                 ext_icon = ("<svg viewBox='0 0 24 24'><path d='M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/>"
                             "<polyline points='15 3 21 3 21 9'/><line x1='10' y1='14' x2='21' y2='3'/></svg>")
 
@@ -1071,7 +1070,7 @@ def render_results(all_qualified, all_failed):
             for q in all_qualified:
                 t_val = q.get("ticker", "")
                 ss_lnk = f"https://app.stocksimplifier.com/simplify?ticker={urllib.parse.quote(t_val)}"
-                sw_lnk = f"https://simplywall.st/stocks/{urllib.parse.quote(t_val.lower())}"
+                sw_lnk = f"https://simplywall.st/search?{urllib.parse.urlencode({'q': t_val})}"
                 row = (
                     t_val,
                     q.get("company_name","").replace(","," "),
