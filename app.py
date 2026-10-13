@@ -42,23 +42,91 @@ DEFAULT_PRICE_MAX = 50.0
 DEFAULT_IV_MIN = 28.0
 DEFAULT_IV_MAX = 48.0
 DEFAULT_MIN_VOLUME = 2_000_000
-DEEP_SCREEN_WORKERS = 3
+DEEP_SCREEN_WORKERS = 2
 SCREEN_CACHE_TTL = 3600
 FAILED_TICKERS = []
 MISSING_PRICES = []
 
+_YF_SESSION = None
 
-def fetch_with_retry(fn, max_retries=2, base_delay=0.5):
+
+def get_yfinance_session():
+    """Initialize or return shared requests.Session with Yahoo Finance authentication cookies and crumb."""
+    global _YF_SESSION
+    if _YF_SESSION is not None:
+        return _YF_SESSION
+
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    })
+    try:
+        # 1. Fetch initial cookies from fc.yahoo.com
+        sess.get("https://fc.yahoo.com/", timeout=10)
+        # 2. Request authentication crumb
+        r = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10)
+        if r.status_code == 200 and r.text.strip():
+            crumb = r.text.strip()
+            # If internal scraper attributes exist, update them
+            if hasattr(yf, "scrapers") and hasattr(yf.scrapers, "quote"):
+                setattr(yf.scrapers.quote, "DEFAULT_CRUMB", crumb)
+                setattr(yf.scrapers.quote, "DEFAULT_COOKIE", "; ".join(f"{k}={v}" for k, v in sess.cookies.items()))
+    except Exception:
+        pass  # Fall back to standard session
+
+    _YF_SESSION = sess
+    return _YF_SESSION
+
+
+def fetch_with_retry(fn, max_retries=3, base_delay=1.0):
+    global _YF_SESSION
     for attempt in range(max_retries):
         try:
             result = fn()
             if result is None:
                 raise ValueError("None response")
+            if hasattr(result, "status_code") and result.status_code == 401:
+                _YF_SESSION = None  # Reset session to refresh crumb on 401
+                raise ValueError("401 Unauthorized — crumb expired")
             return result
         except Exception:
             if attempt < max_retries - 1:
-                time.sleep(base_delay * (attempt + 1))
+                delay = base_delay * (2 ** attempt)
+                time.sleep(delay)
     return None
+
+
+def test_yahoo_connectivity():
+    """Verify Yahoo Finance API works before heavy lifting."""
+    sess = get_yfinance_session()
+    try:
+        test = yf.Ticker("AAPL", session=sess)
+        info = fetch_with_retry(lambda: test.info, max_retries=2, base_delay=1.0)
+        if not info or not info.get("symbol"):
+            st.error("❌ Yahoo Finance connection failed or is rate-limiting requests.")
+            st.info("💡 Please wait a few minutes before retrying.")
+            return False
+        return True
+    except Exception as e:
+        st.error(f"❌ Yahoo Finance connectivity error: {e}")
+        return False
+
+
+def pre_filter_tickers(tickers):
+    """Remove obvious delisted, warrant, unit, right, and problematic ticker symbols."""
+    valid = []
+    for t in tickers:
+        s = str(t).strip().upper()
+        # Skip warrants, units, rights (e.g. -WS, -WT, -W, -U, -R, or 5-char ending in W/U/R)
+        if re.search(r"[-.](?:WS|WT|W|U|R|RT)$", s):
+            continue
+        if len(s) == 5 and s[-1] in ("W", "U", "R"):
+            continue
+        # Ensure standard ticker pattern (letters, optional single hyphen for class shares like BRK-B)
+        if not re.match(r"^[A-Z]{1,5}(?:-[A-Z]{1,2})?$", s):
+            continue
+        valid.append(s)
+    return valid
 
 
 @st.cache_resource
@@ -160,7 +228,8 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
         "driver": "", "options_liquid": False,
     }
     try:
-        stock = yf.Ticker(ticker)
+        sess = get_yfinance_session()
+        stock = yf.Ticker(ticker, session=sess)
         info = fetch_with_retry(lambda: stock.info)
         if info is None:
             if ticker not in FAILED_TICKERS:
@@ -496,14 +565,16 @@ def scan_tier(tier_name, tickers, price_min, price_max,
     if not tickers:
         return [], []
 
-    # 1. Industry/name pre-filter (V2 exact)
-    passed = tier_name_filter(tickers)
+    # 1. Industry/name pre-filter & delisted/junk symbol filter
+    passed = pre_filter_tickers(tier_name_filter(tickers))
     if not passed:
         return [], []
 
-    # 2. Batch price & volume filter (yf.download in groups of 250); occupies 0-20% of the bar
+    sess = get_yfinance_session()
+
+    # 2. Batch price & volume filter (yf.download in groups of 150); occupies 0-20% of the bar
     priced = []
-    batch_size = 250
+    batch_size = 150
     for i in range(0, len(passed), batch_size):
         batch = passed[i:i + batch_size]
         report(20 * i / len(passed), f"Filtering {len(passed)} tickers by price & volume", 0)
@@ -515,7 +586,10 @@ def scan_tier(tier_name, tickers, price_min, price_max,
                 progress=False,
                 auto_adjust=False,
                 group_by="ticker",
+                session=sess,
             )
+            # Rate limit backoff between batches to prevent 429s
+            time.sleep(1.0)
             if data.empty:
                 MISSING_PRICES.extend(t for t in batch if t not in MISSING_PRICES)
                 continue
@@ -809,6 +883,8 @@ if run:
         st.error("'To:' must be greater than 'From:'.")
     elif not selected:
         st.error("Select at least one tier.")
+    elif not test_yahoo_connectivity():
+        pass
     else:
         FAILED_TICKERS.clear()
         MISSING_PRICES.clear()
@@ -896,6 +972,7 @@ def render_results(all_qualified, all_failed):
                 cagr = q.get("cagr")
                 cagr_html = (f"<b class='{'pos' if cagr >= 0 else 'neg'}'>{cagr:+.1f}%</b>"
                              if cagr is not None else "<b>—</b>")
+                name = html.escape(q.get("company_name", ""))
                 tkr = q.get("ticker", "")
                 tkr_esc = html.escape(tkr)
                 tkr_param = urllib.parse.quote(tkr)
